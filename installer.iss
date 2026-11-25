@@ -2,16 +2,9 @@
 #define AppName "Mostafa-MultiWidget"
 #define AppVersion "1.1.1"
 #define AppExe "Mostafa-MultiWidget.exe"
-; The build step may have produced the program under its new or its old folder name; accept both.
-#if DirExists("dist\Mostafa-MultiWidget")
-  #define BuildDir "Mostafa-MultiWidget"
-  #define BuiltExe "Mostafa-MultiWidget.exe"
-  #define SetupName "Mostafa-MultiWidget-Setup"
-#else
-  #define BuildDir "MyIPWidget"
-  #define BuiltExe "MyIPWidget.exe"
-  #define SetupName "MyIPWidget-Setup"
-#endif
+#define BuildDir "Mostafa-MultiWidget"
+#define BuiltExe "Mostafa-MultiWidget.exe"
+#define SetupName "Mostafa-MultiWidget-Setup"
 
 [Setup]
 AppId={{D5FE5497-F778-4CD9-90BC-1B35C2F9D6DC}
