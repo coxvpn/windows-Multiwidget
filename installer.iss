@@ -1,10 +1,17 @@
 ; Inno Setup script - builds Mostafa-MultiWidget-Setup.exe from the PyInstaller output in dist\Mostafa-MultiWidget
 #define AppName "Mostafa-MultiWidget"
-#define AppVersion "1.1.1"
+#define AppVersion "1.2.1"
 #define AppExe "Mostafa-MultiWidget.exe"
-#define BuildDir "Mostafa-MultiWidget"
-#define BuiltExe "Mostafa-MultiWidget.exe"
-#define SetupName "Mostafa-MultiWidget-Setup"
+; The build step may have produced the program under its new or its old folder name; accept both.
+#if DirExists("dist\Mostafa-MultiWidget")
+  #define BuildDir "Mostafa-MultiWidget"
+  #define BuiltExe "Mostafa-MultiWidget.exe"
+  #define SetupName "Mostafa-MultiWidget-Setup"
+#else
+  #define BuildDir "MyIPWidget"
+  #define BuiltExe "MyIPWidget.exe"
+  #define SetupName "MyIPWidget-Setup"
+#endif
 
 [Setup]
 AppId={{D5FE5497-F778-4CD9-90BC-1B35C2F9D6DC}
@@ -50,4 +57,5 @@ Type: files; Name: "{autoprograms}\MyIP Widget.lnk"
 Type: files; Name: "{autodesktop}\MyIP Widget.lnk"
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+; no tick-box: the widget starts by itself at the end of the setup, so the bar appears in the taskbar at once
+Filename: "{app}\{#AppExe}"; Flags: nowait skipifsilent

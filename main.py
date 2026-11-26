@@ -317,6 +317,7 @@ class App:
         self.usage = ipcore.DailyUsage()
         self._usage_line = self._usage_text()
         self.weather = None          # {'temp': .., 'code': ..} once known
+        self.rate = ipcore.load_cached_rate()   # dollar rate as digits: the saved one until a new one is read
         self._city_dlg = None
 
         self.root = tk.Tk()
@@ -354,6 +355,13 @@ class App:
             location_fn=self._weather_location,
         )
         self.weather_monitor.start()
+        self.rate_monitor = ipcore.RateMonitor(
+            on_update=lambda digits: self.post("rate", digits),
+            enabled_fn=lambda: self.settings.get("show_rate"),
+            fallback=lambda: ipcore.fetch_dollar_rate_api(self.settings.get("rate_api_key")),
+            save=ipcore.save_cached_rate,
+        )
+        self.rate_monitor.start()
         self.root.after(100, self._process_queue)
         self.speed.update()  # first reading; real speeds appear a second later
         self.root.after(1000, self._speed_tick)
@@ -431,6 +439,11 @@ class App:
             self.usage_lbl.grid()
         else:
             self.usage_lbl.grid_remove()
+        self.rate_lbl.config(text=ipcore.format_rate(self.rate))
+        if self.settings.get("show_rate"):
+            self.rate_lbl.grid()
+        else:
+            self.rate_lbl.grid_remove()
 
         if show_weather or show_speed or show_usage:
             self.info.grid()
@@ -467,10 +480,13 @@ class App:
                                   text=self._speed_label_text(0, 0), **info_args)
         self.usage_lbl = tk.Label(self.info, fg=self.dim, font=("Segoe UI", 8),
                                   text=self._usage_line, **info_args)
+        self.rate_lbl = tk.Label(self.info, fg=self.fg, font=("Segoe UI", 9),
+                                 text=ipcore.format_rate(self.rate), **info_args)
         self.weather_lbl.grid(row=0, column=0, sticky="w")
         self.weather_city_lbl.grid(row=1, column=0, sticky="w")
         self.speed_lbl.grid(row=2, column=0, sticky="w", pady=(4, 0))
         self.usage_lbl.grid(row=3, column=0, sticky="w", pady=(2, 0))
+        self.rate_lbl.grid(row=4, column=0, sticky="w", pady=(2, 0))
         self.flag_lbl.grid(row=0, column=0)
         self.info.grid(row=0, column=1, padx=(10, 0))
 
@@ -490,7 +506,7 @@ class App:
 
         # Not bound on the root window itself: its events would fire twice.
         for widget in (self.frame, self.top, self.info, self.flag_lbl, self.weather_lbl,
-                       self.weather_city_lbl, self.speed_lbl, self.usage_lbl, self.country_lbl,
+                       self.weather_city_lbl, self.speed_lbl, self.usage_lbl, self.rate_lbl, self.country_lbl,
                        self.ip_lbl, self.detail_lbl, self.credit_lbl):
             widget.bind("<ButtonPress-1>", self._drag_start)
             widget.bind("<B1-Motion>", self._drag_move)
@@ -510,6 +526,7 @@ class App:
         self.weather_var = tk.BooleanVar(value=self.settings.get("show_weather"))
         self.speed_var = tk.BooleanVar(value=self.settings.get("show_speed"))
         self.usage_var = tk.BooleanVar(value=self.settings.get("show_usage"))
+        self.rate_var = tk.BooleanVar(value=self.settings.get("show_rate"))
         self.strip_var = tk.BooleanVar(value=self.settings.get("show_strip"))
         self.embed_var = tk.BooleanVar(value=self.settings.get("strip_embed"))
         self.pin_var = tk.BooleanVar(value=self.pinned)
@@ -527,6 +544,8 @@ class App:
                                   command=lambda: self._toggle_option("show_speed", self.speed_var))
         self.menu.add_checkbutton(label="Bar: show today's data usage", variable=self.usage_var,
                                   command=lambda: self._toggle_option("show_usage", self.usage_var))
+        self.menu.add_checkbutton(label="Bar: show dollar rate", variable=self.rate_var,
+                                  command=lambda: self._toggle_option("show_rate", self.rate_var))
         self.menu.add_checkbutton(label="Show bar beside the clock", variable=self.strip_var,
                                   command=lambda: self._toggle_option("show_strip", self.strip_var))
         if ipcore.IS_WINDOWS:
@@ -534,6 +553,7 @@ class App:
                                       variable=self.embed_var,
                                       command=lambda: self._toggle_option("strip_embed", self.embed_var))
         self.menu.add_command(label="Choose city for weather...", command=self.choose_city)
+        self.menu.add_command(label="Detect my city automatically", command=self.detect_city)
         self.menu.add_command(label="Check for updates", command=lambda: self.show_about(check=True))
         self.menu.add_command(label="About", command=self.show_about)
         self.menu.add_checkbutton(label="Keep on desktop", variable=self.pin_var,
@@ -656,6 +676,8 @@ class App:
         self.settings.set(key, bool(var.get()))
         if key == "show_weather":
             self.weather_monitor.refresh()
+        if key == "show_rate" and var.get():
+            self.rate_monitor.refresh()
         self._refresh_info()
         self._apply_tray_title()
         self._strip_w = 0          # let the bar shrink / grow to the new content
@@ -679,8 +701,8 @@ class App:
     def _toggle_setting(self, key):
         """Flips one of the on/off choices (used by the tray menu)."""
         var = {"show_weather": self.weather_var, "show_speed": self.speed_var,
-               "show_usage": self.usage_var, "show_strip": self.strip_var,
-               "strip_embed": self.embed_var}.get(key)
+               "show_usage": self.usage_var, "show_rate": self.rate_var,
+               "show_strip": self.strip_var, "strip_embed": self.embed_var}.get(key)
         if var is None:
             return
         var.set(not bool(self.settings.get(key)))      # flip what is really stored
@@ -711,7 +733,8 @@ class App:
         self.strip_weather = tk.Label(self.strip_box, font=("Segoe UI", 11), width=8, **label_args)
         self.strip_speed = tk.Label(self.strip_box, font=("Segoe UI", 9), width=10, height=2, **label_args)
         self.strip_usage = tk.Label(self.strip_box, font=("Segoe UI", 9), width=11, height=2, **label_args)
-        self.strip_labels = (self.strip_weather, self.strip_speed, self.strip_usage)
+        self.strip_rate = tk.Label(self.strip_box, font=("Segoe UI", 10), width=9, **label_args)
+        self.strip_labels = (self.strip_weather, self.strip_speed, self.strip_usage, self.strip_rate)
         # no flag here: the tray icon already shows it
         for widget in (self.strip, self.strip_box) + self.strip_labels:
             widget.bind("<ButtonPress-1>", self._strip_press)
@@ -747,8 +770,8 @@ class App:
         return f"{mb:.1f} M/s" if mb < 100 else f"{int(mb)} M/s"
 
     def _strip_texts(self):
-        """The three pieces of the bar; None means 'not shown'."""
-        weather = speed = usage = None
+        """The four pieces of the bar; None means 'not shown'."""
+        weather = speed = usage = rate = None
         if self.settings.get("show_weather") and self._weather_wanted():
             weather = (f"{ipcore.weather_symbol(self.weather['code'])} "
                        f"{ipcore.format_temp(self.weather['temp'])}") if self.weather else "..."
@@ -758,7 +781,9 @@ class App:
         if self.settings.get("show_usage"):
             usage = (f"\u2193 {ipcore.format_bytes(self.usage.down)}\n"
                      f"\u2191 {ipcore.format_bytes(self.usage.up)}")
-        return weather, speed, usage
+        if self.settings.get("show_rate"):
+            rate = ipcore.format_rate(self.rate)
+        return weather, speed, usage, rate
 
     def _refresh_strip(self):
         if self.closing:
@@ -771,7 +796,7 @@ class App:
         changed = False
         texts = self._strip_texts()
         if texts != self._strip_shown:
-            shown = self._strip_shown or (None, None, None)
+            shown = self._strip_shown or (None, None, None, None)
             self._strip_shown = texts
             changed = [t is None for t in texts] != [t is None for t in shown]
             if changed:          # a different set of parts: lay them out again, in order
@@ -988,10 +1013,42 @@ class App:
         self._apply_tray_title()
         self.show_window()
 
+    def _auto_city(self, state, force=False):
+        """Takes the city and its position from the IP lookup (first run, or the menu item).
+
+        Only while no city has been chosen, unless force is set. With a VPN the IP shows the
+        VPN's place, so the menu item lets the user do it again with the VPN off.
+        """
+        if not force and (not self.settings.get("city_auto") or self._weather_wanted()):
+            return False
+        lat, lon = state.get("lat"), state.get("lon")
+        name = state.get("city") or state.get("country")
+        if lat is None or lon is None or not name:
+            return False
+        self.settings.set("city_name", name, save=False)
+        self.settings.set("city_lat", lat, save=False)
+        self.settings.set("city_lon", lon, save=False)
+        self.settings.set("city_auto", True, save=False)
+        self.settings.set("show_weather", True)
+        self.weather_var.set(True)
+        self.weather = None
+        self.weather_monitor.refresh()
+        self._refresh_info()
+        self._apply_tray_title()
+        self._refresh_strip()
+        return True
+
+    def detect_city(self):
+        if not self._auto_city(self.state, force=True):
+            self._flash("No location yet")
+            return
+        self.show_window()
+
     def _city_clear(self):
         self.settings.set("city_name", "", save=False)
         self.settings.set("city_lat", None, save=False)
-        self.settings.set("city_lon", None)
+        self.settings.set("city_lon", None, save=False)
+        self.settings.set("city_auto", False)      # the user does not want one: do not bring it back
         self.weather = None
         self._city_close()
         self.weather_monitor.refresh()
@@ -1186,7 +1243,10 @@ class App:
                      checked=lambda item: bool(self.settings.get("show_speed"))),
             MenuItem("Bar: show today's data usage", lambda icon, item: self.post("opt", "show_usage"),
                      checked=lambda item: bool(self.settings.get("show_usage"))),
+            MenuItem("Bar: show dollar rate", lambda icon, item: self.post("opt", "show_rate"),
+                     checked=lambda item: bool(self.settings.get("show_rate"))),
             MenuItem("Choose city for weather...", lambda icon, item: self.post("city")),
+            MenuItem("Detect my city automatically", lambda icon, item: self.post("detect")),
             MenuItem("Check for updates", lambda icon, item: self.post("about", True)),
             MenuItem("About", lambda icon, item: self.post("about", False)),
             MenuItem("Keep on desktop", lambda icon, item: self.post("pin"),
@@ -1263,12 +1323,17 @@ class App:
         if kind == "data":
             self.state, self.checking = payload, False
             self._render()
+            self._auto_city(payload)
         elif kind == "weather":
             # a failed lookup keeps the old temperature; "no city" clears it
             if payload is not None or not self._weather_wanted():
                 self.weather = payload
             self._refresh_info()
             self._apply_tray_title()
+            self._refresh_strip()
+        elif kind == "rate":
+            self.rate = payload
+            self._refresh_info()
             self._refresh_strip()
         elif kind == "about":
             self.show_about(check=bool(payload))
@@ -1278,6 +1343,8 @@ class App:
             self._toggle_setting(payload)
         elif kind == "city":
             self.choose_city()
+        elif kind == "detect":
+            self.detect_city()
         elif kind == "cities":
             self._city_results(*payload)
         elif kind == "toggle":
@@ -1307,6 +1374,7 @@ class App:
         self.usage.save(force=True)
         self.monitor.stop()
         self.weather_monitor.stop()
+        self.rate_monitor.stop()
         if self.tray:
             try:
                 self.tray.stop()

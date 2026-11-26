@@ -89,8 +89,8 @@ class UpdateTests(unittest.TestCase):
         self.assertFalse(ipcore.is_newer("latest", "1.1.0"))
 
     def test_check_reads_the_tag(self):
-        http = FakeHttp({ipcore.RELEASES_API: FakeResponse({"tag_name": "v1.2.0"})})
-        self.assertEqual(ipcore.check_for_update(http), {"tag": "v1.2.0"})
+        http = FakeHttp({ipcore.RELEASES_API: FakeResponse({"tag_name": "v1.10.0"})})
+        self.assertEqual(ipcore.check_for_update(http), {"tag": "v1.10.0"})
 
     def test_no_release_and_failure_are_different(self):
         http = FakeHttp({ipcore.RELEASES_API: FakeResponse({}, status=404)})
@@ -128,10 +128,31 @@ class PublicIpTests(unittest.TestCase):
 class LocationTests(unittest.TestCase):
     def test_ipwho(self):
         payload = {"success": True, "country": "Germany", "country_code": "de",
-                   "city": "Berlin", "connection": {"isp": "Example ISP"}}
+                   "city": "Berlin", "connection": {"isp": "Example ISP"},
+                   "latitude": 52.52, "longitude": 13.405}
         http = FakeHttp({"https://ipwho.is/1.1.1.1": FakeResponse(payload)})
         self.assertEqual(ipcore.lookup_location("1.1.1.1", http),
-                         {"country": "Germany", "code": "DE", "city": "Berlin", "isp": "Example ISP"})
+                         {"country": "Germany", "code": "DE", "city": "Berlin", "isp": "Example ISP",
+                          "lat": 52.52, "lon": 13.405})
+
+    def test_position_from_each_source(self):
+        ip_api = ipcore._from_ip_api({"status": "success", "country": "Iran", "countryCode": "IR",
+                                      "city": "Tehran", "isp": "X", "lat": 35.69, "lon": 51.42})
+        self.assertEqual((ip_api["lat"], ip_api["lon"]), (35.69, 51.42))
+        co = ipcore._from_ipapi_co({"country_name": "Iran", "country_code": "IR", "city": "Karaj",
+                                    "org": "X", "latitude": "35.83", "longitude": "50.99"})
+        self.assertEqual((co["lat"], co["lon"]), (35.83, 50.99))
+
+    def test_missing_or_wrong_position_is_none(self):
+        for lat, lon in ((None, None), ("x", 1), (91, 0), (0, 181), (0, 0)):
+            self.assertEqual(ipcore._coords(lat, lon), (None, None))
+
+    def test_state_carries_the_position(self):
+        loc = {"country": "Iran", "code": "IR", "city": "Tehran", "isp": "X", "lat": 35.69, "lon": 51.42}
+        state = ipcore.make_state("1.2.3.4", loc)
+        self.assertEqual((state["lat"], state["lon"]), (35.69, 51.42))
+        offline = ipcore.make_state()
+        self.assertEqual((offline["lat"], offline["lon"]), (None, None))
 
     def test_fallback_to_second_source(self):
         http = FakeHttp({
@@ -433,6 +454,119 @@ class WeatherTests(unittest.TestCase):
         nothing = ipcore.WeatherMonitor(seen.append, lambda: None)
         self.assertTrue(nothing.poll_once())
         self.assertEqual(seen[-1], None)
+
+
+class DollarRateTests(unittest.TestCase):
+    def test_newest_line_wins_and_persian_digits_work(self):
+        html = "<p>\u062f\u0644\u0627\u0631: 98,500 \u062a\u0648\u0645\u0627\u0646</p><p>\u062f\u0644\u0627\u0631: \u06f9\u06f9\u066c\u06f1\u06f0\u06f0 \u062a\u0648\u0645\u0627\u0646</p>"
+        self.assertEqual(ipcore.parse_dollar_rate(html), "99100")
+
+    def test_number_after_the_word_is_the_fallback(self):
+        self.assertEqual(ipcore.parse_dollar_rate("<b>\u0642\u06cc\u0645\u062a \u062f\u0644\u0627\u0631 \u0627\u0645\u0631\u0648\u0632 105,200</b>"), "105200")
+
+    def test_nothing_or_nonsense(self):
+        self.assertIsNone(ipcore.parse_dollar_rate("hello"))
+        self.assertIsNone(ipcore.parse_dollar_rate(""))
+        self.assertIsNone(ipcore.parse_dollar_rate(None))
+        self.assertIsNone(ipcore.parse_dollar_rate("\u062f\u0644\u0627\u0631: 12,3"))
+
+    def test_fetch(self):
+        page = "\u062f\u0644\u0627\u0631: 98,500 \u062a\u0648\u0645\u0627\u0646"
+        http = FakeHttp({ipcore.RATE_URL: FakeResponse(text=page)})
+        self.assertEqual(ipcore.fetch_dollar_rate(http), "98500")
+        self.assertIsNone(ipcore.fetch_dollar_rate(FakeHttp({})))
+        self.assertIsNone(ipcore.fetch_dollar_rate(FakeHttp({ipcore.RATE_URL: FakeResponse(status=500)})))
+
+    def test_format(self):
+        self.assertEqual(ipcore.format_rate("98500"), "$ 98,500")
+        self.assertEqual(ipcore.format_rate(None), "$ ...")
+        self.assertEqual(ipcore.format_rate("abc"), "$ ...")
+
+    def test_monitor(self):
+        seen = []
+        ok = ipcore.RateMonitor(seen.append, fetch=lambda: "98500")
+        self.assertTrue(ok.poll_once())
+        self.assertEqual(seen, ["98500"])
+        failing = ipcore.RateMonitor(seen.append, fetch=lambda: None)
+        self.assertFalse(failing.poll_once())
+        self.assertEqual(seen, ["98500"])          # a failed read tells nobody: the old value stays
+        off = ipcore.RateMonitor(seen.append, enabled_fn=lambda: False, fetch=lambda: "1")
+        self.assertTrue(off.poll_once())
+        self.assertEqual(seen, ["98500"])
+
+
+class RateFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "rate.json")
+
+    def test_json_wrapper_does_not_matter(self):
+        flat = [{"assetId": "eur", "price": 311690}, {"assetId": "usd", "price": 284200}]
+        wrapped = {"data": {"rates": flat}, "meta": {"source": "live"}}
+        self.assertEqual(ipcore.parse_rate_json(flat), "284200")
+        self.assertEqual(ipcore.parse_rate_json(wrapped), "284200")
+        self.assertEqual(ipcore.parse_rate_json([{"assetId": "usd", "price": "284,200"}]), "284200")
+
+    def test_json_nonsense(self):
+        self.assertIsNone(ipcore.parse_rate_json({"data": []}))
+        self.assertIsNone(ipcore.parse_rate_json([{"assetId": "eur", "price": 1000}]))
+        self.assertIsNone(ipcore.parse_rate_json([{"assetId": "usd", "price": "abc"}]))
+        self.assertIsNone(ipcore.parse_rate_json([{"assetId": "usd", "price": 12}]))
+        self.assertIsNone(ipcore.parse_rate_json(None))
+
+    def test_api_needs_a_key_and_sends_it(self):
+        http = FakeHttp({ipcore.RATE_API_URL: FakeResponse(payload=[{"assetId": "usd", "price": 284200}])})
+        self.assertIsNone(ipcore.fetch_dollar_rate_api("", http))
+        self.assertEqual(http.calls, [])                       # no key: nothing is even asked
+        self.assertEqual(ipcore.fetch_dollar_rate_api("k", http), "284200")
+        self.assertIsNone(ipcore.fetch_dollar_rate_api("k", FakeHttp({})))
+        self.assertIsNone(ipcore.fetch_dollar_rate_api("k", FakeHttp({ipcore.RATE_API_URL: FakeResponse(status=403)})))
+
+    def test_fallback_runs_only_when_the_main_source_fails(self):
+        seen, saved = [], []
+        both = ipcore.RateMonitor(seen.append, fetch=lambda: "98500", fallback=lambda: "1", save=saved.append)
+        self.assertTrue(both.poll_once())
+        self.assertEqual((seen, saved), (["98500"], ["98500"]))
+        backup = ipcore.RateMonitor(seen.append, fetch=lambda: None, fallback=lambda: "99000", save=saved.append)
+        self.assertTrue(backup.poll_once())
+        self.assertEqual((seen[-1], saved[-1]), ("99000", "99000"))
+        none = ipcore.RateMonitor(seen.append, fetch=lambda: None, fallback=lambda: None, save=saved.append)
+        self.assertFalse(none.poll_once())
+        self.assertEqual(len(seen), 2)
+
+    def test_cache_round_trip_and_age(self):
+        self.assertIsNone(ipcore.load_cached_rate(self.path))
+        ipcore.save_cached_rate("98500", self.path, now=lambda: 1000.0)
+        self.assertEqual(ipcore.load_cached_rate(self.path, now=lambda: 1000.0 + 3600), "98500")
+        self.assertIsNone(ipcore.load_cached_rate(self.path, now=lambda: 1000.0 + 3 * 24 * 3600))   # too old
+        self.assertIsNone(ipcore.load_cached_rate(self.path, now=lambda: 500.0))                     # clock went back
+
+    def test_broken_cache_file_is_ignored(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertIsNone(ipcore.load_cached_rate(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"digits": "abc", "time": 1}, fh)
+        self.assertIsNone(ipcore.load_cached_rate(self.path, now=lambda: 2.0))
+
+    def test_key_setting_is_a_clean_string(self):
+        self.assertEqual(ipcore._validate("rate_api_key", " abc\n"), "abc")
+        self.assertEqual(ipcore._validate("rate_api_key", 5), "")
+        self.assertEqual(ipcore.DEFAULT_SETTINGS["rate_api_key"], "")
+
+
+class FirstRunDefaultTests(unittest.TestCase):
+    def test_new_install_shows_everything_by_itself(self):
+        d = ipcore.DEFAULT_SETTINGS
+        for key in ("show_strip", "strip_embed", "show_speed", "show_usage", "show_weather",
+                    "show_rate", "city_auto"):
+            self.assertTrue(d[key], key)
+        self.assertIsNone(d["city_lat"])
+
+    def test_new_switches_are_validated(self):
+        self.assertTrue(ipcore._validate("show_rate", "yes"))      # not a bool: back to the default
+        self.assertFalse(ipcore._validate("city_auto", False))
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from logging.handlers import RotatingFileHandler
 
 import requests
 
-__version__ = "1.1.1"
+__version__ = "1.2.1"
 __author__ = "Mostafa Mandegari"
 
 APP_NAME = "Mostafa MultiWidget"
@@ -74,7 +74,10 @@ DEFAULT_SETTINGS = {
     "show_usage": True,     # today's downloaded / uploaded volume
     "show_weather": True,   # only shown once a city has been chosen
     "show_strip": True,     # the small always-visible bar beside the clock
-    "strip_embed": False,   # Windows 10: build the bar into the taskbar itself (opt-in)
+    "strip_embed": True,    # Windows 10: build the bar into the taskbar itself (falls back to a floating bar)
+    "show_rate": True,      # the dollar rate (Toman)
+    "rate_api_key": "",     # optional: key of a second price service (used only when the first source fails)
+    "city_auto": True,      # find the city by itself (from the IP) while no city has been chosen
     "strip_x": None,
     "strip_y": None,
     "city_name": "",
@@ -97,10 +100,13 @@ def _validate(key, value):
             return min(1.0, max(0.2, float(value)))
         if key == "interval":
             return min(300, max(5, int(value)))
-        if key in ("show_details", "pinned", "show_speed", "show_usage", "show_weather", "show_strip", "strip_embed"):
+        if key in ("show_details", "pinned", "show_speed", "show_usage", "show_weather", "show_strip", "strip_embed",
+                   "show_rate", "city_auto"):
             return value if isinstance(value, bool) else default
         if key == "city_name":
             return _clean(value, 60) if isinstance(value, str) else default
+        if key == "rate_api_key":
+            return _clean(value, 200) if isinstance(value, str) else default
         if key in ("city_lat", "city_lon"):
             if value is None or isinstance(value, bool):
                 return None
@@ -196,37 +202,54 @@ def fetch_public_ip(http=requests, endpoints=None):
 
 
 # Step 2: details (country, city, provider) - only asked when the IP changes.
+def _coords(lat, lon):
+    """(lat, lon) as floats, or (None, None) when they are missing or out of range."""
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None, None
+    if -90 <= lat <= 90 and -180 <= lon <= 180 and (lat or lon):
+        return lat, lon
+    return None, None
+
+
 def _from_ipwho(d):
     if not d.get("success"):
         raise ValueError("ipwho.is returned an error")
     conn = d.get("connection") or {}
+    lat, lon = _coords(d.get("latitude"), d.get("longitude"))
     return {
         "country": _clean(d.get("country")),
         "code": _clean_code(d.get("country_code")),
         "city": _clean(d.get("city")),
         "isp": _clean(conn.get("isp") or conn.get("org")),
+        "lat": lat, "lon": lon,
     }
 
 
 def _from_ipapi_co(d):
     if d.get("error"):
         raise ValueError("ipapi.co returned an error")
+    lat, lon = _coords(d.get("latitude"), d.get("longitude"))
     return {
         "country": _clean(d.get("country_name")),
         "code": _clean_code(d.get("country_code")),
         "city": _clean(d.get("city")),
         "isp": _clean(d.get("org")),
+        "lat": lat, "lon": lon,
     }
 
 
 def _from_ip_api(d):
     if d.get("status") != "success":
         raise ValueError("ip-api returned an error")
+    lat, lon = _coords(d.get("lat"), d.get("lon"))
     return {
         "country": _clean(d.get("country")),
         "code": _clean_code(d.get("countryCode")),
         "city": _clean(d.get("city")),
         "isp": _clean(d.get("isp")),
+        "lat": lat, "lon": lon,
     }
 
 
@@ -258,7 +281,7 @@ def make_state(ip=None, location=None):
     """The dictionary the user interface displays."""
     if not ip:
         return {"online": False, "ip": "", "country": "", "code": "",
-                "city": "", "isp": "", "located": False}
+                "city": "", "isp": "", "lat": None, "lon": None, "located": False}
     loc = location or {}
     return {
         "online": True,
@@ -267,6 +290,8 @@ def make_state(ip=None, location=None):
         "code": loc.get("code", ""),
         "city": loc.get("city", ""),
         "isp": loc.get("isp", ""),
+        "lat": loc.get("lat"),
+        "lon": loc.get("lon"),
         "located": bool(location),
     }
 
@@ -336,9 +361,9 @@ class IPMonitor(threading.Thread):
 # --------------------------------------------------------------------------
 # About / updates
 # --------------------------------------------------------------------------
-REPO_URL = "https://github.com/coxvpn/Mostafa-MultiWidget"
-RELEASES_PAGE = REPO_URL + "/releases/latest"
-RELEASES_API = "https://api.github.com/repos/coxvpn/Mostafa-MultiWidget/releases/latest"
+REPO_URL = "https://github.com/coxvpn/windows-Multiwidget"
+RELEASES_PAGE = REPO_URL + "/releases"
+RELEASES_API = "https://api.github.com/repos/coxvpn/windows-Multiwidget/releases/latest"
 
 
 def version_tuple(text):
@@ -355,7 +380,7 @@ def is_newer(latest, current):
 def check_for_update(http=requests):
     """Asks GitHub for the newest release.
 
-    Returns {'tag': '1.2.0'}; {'tag': ''} when no release exists yet; None if it could not be asked.
+    Returns {'tag': 'v1.2.1'}; {'tag': ''} when no release exists yet; None if it could not be asked.
     """
     try:
         resp = http.get(RELEASES_API, timeout=REQUEST_TIMEOUT,
@@ -608,6 +633,170 @@ class WeatherMonitor(threading.Thread):
                 ok = self.poll_once()
             except Exception:
                 log.exception("Unexpected error while checking the weather")
+                ok = False
+            self._wake.wait(timeout=self._interval if ok else self._retry)
+            self._wake.clear()
+
+
+# --------------------------------------------------------------------------
+# Dollar rate (Toman) - same source and same reading rule as the Android app
+# --------------------------------------------------------------------------
+RATE_URL = "https://eitaa.com/talaclinic1"
+
+_PERSIAN_DIGITS = {**{chr(0x06F0 + i): str(i) for i in range(10)},      # Persian digits
+                   **{chr(0x0660 + i): str(i) for i in range(10)},      # Arabic-Indic digits
+                   "\u066c": ",", "\u060c": ","}
+
+
+def parse_dollar_rate(html):
+    """The newest number written after the word "\u062f\u0644\u0627\u0631" on the page (digits only, e.g. '98500'), or None."""
+    text = re.sub(r"<[^>]*>", " ", html or "")
+    text = text.replace("&nbsp;", " ")
+    text = re.sub(r"&[a-zA-Z#0-9]+;", " ", text)
+    text = "".join(_PERSIAN_DIGITS.get(c, c) for c in text)
+    # the line looks like "\u062f\u0644\u0627\u0631: 268,300 \u062a\u0648\u0645\u0627\u0646"; a number right after the word is the fallback
+    matches = (re.findall("\u062f\u0644\u0627\u0631\\s*[:\uff1a]\\s*([0-9][0-9,.]{3,})", text)
+               or re.findall("\u062f\u0644\u0627\u0631[^0-9]{0,40}([0-9][0-9,.]{3,})", text))
+    if not matches:
+        return None
+    digits = "".join(ch for ch in matches[-1] if ch.isdigit())
+    return digits if 4 <= len(digits) <= 9 else None
+
+
+def fetch_dollar_rate(http=requests):
+    """The dollar rate as digits, or None if the page could not be read."""
+    try:
+        resp = http.get(RATE_URL, timeout=REQUEST_TIMEOUT, headers=HEADERS)
+        resp.raise_for_status()
+        return parse_dollar_rate(resp.text)
+    except Exception as exc:
+        log.debug("Dollar rate lookup failed: %s", exc)
+        return None
+
+
+def format_rate(digits):
+    """'98500' -> '$ 98,500'; '$ ...' while it is not known yet."""
+    try:
+        return f"$ {int(digits):,}"
+    except (TypeError, ValueError):
+        return "$ ..."
+
+
+# Second source (only used when the key is set in settings.json and the first source failed).
+RATE_API_URL = "https://arzhaam.ir/api/rates/latest"
+
+
+def parse_rate_json(data):
+    """The US dollar price (Toman, as digits) from a JSON answer, or None.
+
+    Looks for the entry whose assetId is 'usd' anywhere in the answer, so a changed wrapper
+    around the list does not break it.
+    """
+    stack = [data]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if item.get("assetId") == "usd" and "price" in item:
+                try:
+                    price = item["price"]
+                    value = int(round(float(str(price).replace(",", "") if isinstance(price, str) else price)))
+                except (TypeError, ValueError):
+                    return None
+                digits = str(value)
+                return digits if 4 <= len(digits) <= 9 else None
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return None
+
+
+def fetch_dollar_rate_api(key, http=requests):
+    """The dollar rate from the keyed second service, or None (no key, no network, bad answer)."""
+    if not key:
+        return None
+    try:
+        resp = http.get(RATE_API_URL, timeout=REQUEST_TIMEOUT, headers={**HEADERS, "X-App-Key": key})
+        resp.raise_for_status()
+        return parse_rate_json(resp.json())
+    except Exception as exc:
+        log.debug("Second dollar rate source failed: %s", exc)
+        return None
+
+
+RATE_CACHE_MAX_AGE = 2 * 24 * 3600   # a saved rate older than two days is not shown
+
+
+def load_cached_rate(path=None, now=time.time, max_age=RATE_CACHE_MAX_AGE):
+    """The last rate that was read (digits), so the bar is not empty after a restart; None if too old."""
+    path = path or os.path.join(app_data_dir(), "rate.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        digits = str(raw["digits"])
+        age = now() - float(raw["time"])
+        if digits.isdigit() and 4 <= len(digits) <= 9 and 0 <= age <= max_age:
+            return digits
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
+def save_cached_rate(digits, path=None, now=time.time):
+    path = path or os.path.join(app_data_dir(), "rate.json")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"digits": str(digits), "time": now()}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        log.exception("Could not save the dollar rate")
+
+
+class RateMonitor(threading.Thread):
+    """Reads the dollar rate now and then; reports the digits (or None) through on_update.
+
+    If the main source fails, `fallback` (when given) is tried. Every good value goes to `save`.
+    """
+
+    def __init__(self, on_update, enabled_fn=lambda: True, fetch=fetch_dollar_rate,
+                 interval=600, retry=120, fallback=None, save=None):
+        super().__init__(daemon=True, name="rate-monitor")
+        self._on_update = on_update
+        self._enabled_fn = enabled_fn
+        self._fetch = fetch
+        self._fallback = fallback
+        self._save = save
+        self._interval = interval
+        self._retry = retry
+        self._stop_evt = threading.Event()
+        self._wake = threading.Event()
+
+    def refresh(self):
+        self._wake.set()
+
+    def stop(self):
+        self._stop_evt.set()
+        self._wake.set()
+
+    def poll_once(self):
+        """Returns True when no retry is needed soon."""
+        if not self._enabled_fn():
+            return True
+        digits = self._fetch()
+        if digits is None and self._fallback is not None:
+            digits = self._fallback()
+        if digits is not None:          # a failed read keeps the old value on screen
+            if self._save is not None:
+                self._save(digits)
+            self._on_update(digits)
+        return digits is not None
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            try:
+                ok = self.poll_once()
+            except Exception:
+                log.exception("Unexpected error while reading the dollar rate")
                 ok = False
             self._wake.wait(timeout=self._interval if ok else self._retry)
             self._wake.clear()
